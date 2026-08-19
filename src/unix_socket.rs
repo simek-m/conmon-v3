@@ -67,6 +67,198 @@ const SOCKET_BUFFER_SIZE: usize = 32768;
 // package and some data would be lost. See SOCKET_BUFFER_SIZE.
 const CONMON_CLIENT_BUFFER_SIZE: usize = 8192;
 
+/// A fixed-capacity rolling read buffer for socket data.
+struct SocketBuffer<const N: usize> {
+    /// Backing buffer.
+    data: [u8; N],
+
+    /// Index of the first valid byte.
+    start: usize,
+
+    /// Index of the last valid byte + 1.
+    end: usize,
+}
+
+impl<const N: usize> SocketBuffer<N> {
+    fn new() -> Self {
+        Self {
+            data: [0u8; N],
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// Total capacity of the buffer in bytes.
+    fn capacity(&self) -> usize {
+        N
+    }
+
+    /// Returns the valid (unconsumed) bytes currently buffered.
+    fn data(&self) -> &[u8] {
+        &self.data[self.start..self.end]
+    }
+
+    /// Removes all data from the buffer.
+    fn clear(&mut self) {
+        self.start = 0;
+        self.end = 0;
+    }
+
+    /// Try to make space if not already available and report true for success.
+    fn make_space(&mut self) -> bool {
+        if self.end == N {
+            self.compact();
+        }
+        self.end != N
+    }
+
+    /// Compacts the buffer so that valid data starts at index 0.
+    fn compact(&mut self) {
+        if self.start == 0 {
+            // We are done already :-).
+            return;
+        }
+        if self.start >= self.end {
+            // No data, so just reset the values.
+            self.start = 0;
+            self.end = 0;
+            return;
+        }
+
+        let len = self.end - self.start;
+        // Move remaining data to beginning.
+        self.data.copy_within(self.start..self.end, 0);
+        self.start = 0;
+        self.end = len;
+    }
+
+    /// Returns the free space at the tail into which new bytes can be written.
+    fn spare_slice_mut(&mut self) -> &mut [u8] {
+        &mut self.data[self.end..]
+    }
+
+    /// Marks `n` freshly written tail bytes as valid.
+    fn advance_by(&mut self, n: usize) {
+        self.end += n;
+    }
+
+    /// Returns the next newline-terminated line (including the trailing `\n`)
+    /// without consuming it, or `None` if no complete line is buffered yet.
+    fn peek_line(&self) -> Option<&[u8]> {
+        let rel = self.data[self.start..self.end]
+            .iter()
+            .position(|&b| b == b'\n')?;
+
+        Some(&self.data[self.start..=self.start + rel]) // include '\n'
+    }
+
+    /// Consumes `n` bytes from the head of the buffer.
+    fn consume(&mut self, n: usize) {
+        debug_assert!(n <= self.end - self.start, "consume past buffered data");
+
+        self.start += n;
+        if self.start >= self.end {
+            self.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod socket_buffer_tests {
+    use super::*;
+
+    const BUFFER_SIZE: usize = 8;
+
+    /// Simulates RemoteSocket::read() usage.
+    fn write(buf: &mut SocketBuffer<BUFFER_SIZE>, bytes: &[u8]) {
+        assert!(buf.make_space());
+        let dst = buf.spare_slice_mut();
+        dst[..bytes.len()].copy_from_slice(bytes);
+        buf.advance_by(bytes.len());
+    }
+
+    #[test]
+    fn multiple_writes_combined() {
+        let mut buf = SocketBuffer::<BUFFER_SIZE>::new();
+        write(&mut buf, b"abc");
+        write(&mut buf, b"de");
+        assert_eq!(buf.data(), b"abcde");
+    }
+
+    #[test]
+    fn clear_empties_buffer() {
+        let mut buf = SocketBuffer::<BUFFER_SIZE>::new();
+        write(&mut buf, b"abc");
+        buf.clear();
+        assert!(buf.data().is_empty());
+    }
+
+    #[test]
+    fn peek_line_is_non_consuming_and_returns_first_line() {
+        let mut buf = SocketBuffer::<BUFFER_SIZE>::new();
+
+        // No newline - returns None.
+        write(&mut buf, b"ab");
+        assert_eq!(buf.peek_line(), None);
+
+        // Two lines buffered.
+        write(&mut buf, b"\nc\n");
+
+        // Multiple calls are idempotent - only first line returned.
+        assert_eq!(buf.peek_line(), Some(&b"ab\n"[..]));
+        assert_eq!(buf.peek_line(), Some(&b"ab\n"[..]));
+
+        // data() returns both lines.
+        assert_eq!(buf.data(), b"ab\nc\n");
+    }
+
+    #[test]
+    fn consume_advances_head_then_resets_when_drained() {
+        let mut buf = SocketBuffer::<8>::new();
+        write(&mut buf, b"a\nbc");
+
+        // Consume 2 bytes, 2 remain.
+        buf.consume(2);
+        assert_eq!(buf.data(), b"bc");
+
+        // Consume the rest.
+        buf.consume(2);
+
+        // No more data to consume.
+        assert!(buf.data().is_empty());
+
+        // Buffer is empty.
+        assert_eq!(buf.spare_slice_mut().len(), BUFFER_SIZE);
+    }
+
+    #[test]
+    fn make_space_compacts_reclaimed_space() {
+        let mut buf = SocketBuffer::<BUFFER_SIZE>::new();
+
+        // Fill up the buffer.
+        write(&mut buf, b"abcdefgh");
+        assert_eq!(buf.data().len(), BUFFER_SIZE);
+
+        // Consume some.
+        const CONSUMED: usize = 3;
+        buf.consume(CONSUMED); // start = 3
+
+        // Data survives compaction.
+        assert!(buf.make_space());
+        assert_eq!(buf.data(), b"defgh");
+
+        // There is free space now equal to the consumed bytes.
+        assert_eq!(buf.spare_slice_mut().len(), CONSUMED);
+    }
+
+    #[test]
+    fn make_space_fails_when_full() {
+        let mut buf = SocketBuffer::<BUFFER_SIZE>::new();
+        write(&mut buf, b"abcdefgh");
+        assert!(!buf.make_space());
+    }
+}
+
 /// Remote side (attach client or sd-notify FD inside container).
 pub struct RemoteSocket {
     /// Type of this socket.
@@ -75,14 +267,8 @@ pub struct RemoteSocket {
     /// The file descriptor representing the socket.
     pub fd: OwnedFd,
 
-    /// The buffer for a data received from the socket.
-    pub buf: [u8; SOCKET_BUFFER_SIZE],
-
-    /// Index of the first valid byte.
-    buf_start: usize,
-
-    /// One past the last valid byte.
-    buf_end: usize,
+    /// The buffer for data received from the socket.
+    buf: SocketBuffer<SOCKET_BUFFER_SIZE>,
 
     /// Handler to call on new data.
     handler: Option<RemoteSocketHandler>,
@@ -94,7 +280,7 @@ impl fmt::Debug for RemoteSocket {
             .field("socket_type", &self.socket_type)
             .field("fd", &self.fd)
             // avoid dumping the whole 8K buffer
-            .field("buf_len", &self.buf.len())
+            .field("buf_len", &self.buf.capacity())
             .finish()
     }
 }
@@ -105,9 +291,7 @@ impl RemoteSocket {
         Self {
             socket_type,
             fd,
-            buf: [0u8; SOCKET_BUFFER_SIZE],
-            buf_start: 0,
-            buf_end: 0,
+            buf: SocketBuffer::new(),
             handler: None,
         }
     }
@@ -126,30 +310,9 @@ impl RemoteSocket {
         self.handler = Some(Box::new(handler));
     }
 
-    /// Compacts the buffer so that valid data starts at index 0.
-    fn compact_buffer(&mut self) {
-        if self.buf_start == 0 {
-            // We are done already :-).
-            return;
-        }
-        if self.buf_start >= self.buf_end {
-            // No data, so just reset the values.
-            self.buf_start = 0;
-            self.buf_end = 0;
-            return;
-        }
-
-        let len = self.buf_end - self.buf_start;
-        // Move remaining data to beginning.
-        self.buf.copy_within(self.buf_start..self.buf_end, 0);
-        self.buf_start = 0;
-        self.buf_end = len;
-    }
-
     /// Removes all data from the buffer.
     pub fn clear_buffer(&mut self) {
-        self.buf_start = 0;
-        self.buf_end = 0;
+        self.buf.clear();
     }
 
     /// Reads some bytes into the rolling buffer, without dispatching yet.
@@ -159,16 +322,12 @@ impl RemoteSocket {
     /// * The number of bytes read.
     pub fn read(&mut self) -> ConmonResult<usize> {
         // Ensure there is a space. If we are full, try compacting first.
-        if self.buf_end == self.buf.len() {
-            self.compact_buffer();
-            if self.buf_end == self.buf.len() {
-                // Still no room: line is longer than buffer.
-                return Err(ConmonError::new("line too long for buffer", 1));
-            }
+        if !self.buf.make_space() {
+            return Err(ConmonError::new("line too long for buffer", 1));
         }
 
         // Read the data using `read` or `recvfrom`.
-        let dst = &mut self.buf[self.buf_end..];
+        let dst = self.buf.spare_slice_mut();
         let n = loop {
             match self.socket_type {
                 SocketType::Stdout
@@ -207,21 +366,16 @@ impl RemoteSocket {
             }
         };
 
-        // EOF or no data
-        if n == 0 {
-            return Ok(0);
-        }
-
-        self.buf_end += n;
+        self.buf.advance_by(n);
         Ok(n)
     }
 
     /// Returns the next newline-terminated control line as owned UTF-8 text.
     ///
-    /// Consumes a complete line (including the trailing `\n`) by advancing
-    /// `buf_start` before UTF-8 decoding so invalid UTF-8 cannot be retried
-    /// forever. Remaining bytes stay in place until `read()` compacts the
-    /// buffer when more space is needed.
+    /// The line (including the trailing `\n`) is consumed from the buffer
+    /// before decoding, so invalid UTF-8 cannot be retried forever. Remaining
+    /// bytes stay in place until the buffer is compacted when more space is
+    /// needed.
     ///
     /// # Returns
     ///
@@ -229,25 +383,15 @@ impl RemoteSocket {
     /// * `Ok(None)` - No complete newline-terminated line is buffered yet.
     /// * `Err(_)` - The consumed line is not valid UTF-8.
     pub fn next_line(&mut self) -> ConmonResult<Option<String>> {
-        let Some(rel) = self.buf[self.buf_start..self.buf_end]
-            .iter()
-            .position(|&b| b == b'\n')
-        else {
+        let Some(line) = self.buf.peek_line() else {
             return Ok(None);
         };
 
-        let line_start = self.buf_start;
-        let line_end = line_start + rel + 1; // include '\n'
-        let raw = self.buf[line_start..line_end].to_vec();
+        let len = line.len();
+        let decoded = std::str::from_utf8(line).map(str::to_owned);
+        self.buf.consume(len);
 
-        // Advance before decoding so invalid UTF-8 is not retried forever.
-        self.buf_start = line_end;
-        if self.buf_start == self.buf_end {
-            self.buf_start = 0;
-            self.buf_end = 0;
-        }
-
-        match String::from_utf8(raw) {
+        match decoded {
             Ok(line) => Ok(Some(line)),
             Err(err) => Err(ConmonError::new(
                 format!("control line is not valid UTF-8: {err}"),
@@ -268,9 +412,7 @@ impl From<UnixSocket> for RemoteSocket {
         RemoteSocket {
             socket_type: us.socket_type,
             fd: us.fd.take().unwrap(),
-            buf: [0u8; SOCKET_BUFFER_SIZE],
-            buf_start: 0,
-            buf_end: 0,
+            buf: SocketBuffer::new(),
             handler: None,
         }
     }
@@ -694,14 +836,14 @@ impl Socket {
 
                 // If the Socket has a handler, call the handler directly and return.
                 if let Some(handler) = r.handler.as_mut() {
-                    return Ok(handler(&r.buf[..bytes_read]));
+                    return Ok(handler(r.buf.data()));
                 }
 
                 match r.socket_type {
                     SocketType::Stdout | SocketType::Stderr | SocketType::Terminal => {
                         // Forward data to logs.
                         let is_stderr = r.socket_type == SocketType::Stderr;
-                        let _ = log_plugin.write(!is_stderr, &r.buf[..bytes_read]);
+                        let _ = log_plugin.write(!is_stderr, r.buf.data());
 
                         // Forward data to remote sockets attached to `attach` socket.
                         // The data is prefixed with single byte indicating whether
@@ -716,7 +858,7 @@ impl Socket {
                         // buffer has 8192+1 bytes. It would be nice to unify that, but we need to
                         // keep the backwards compatibility for now. We also have to keep using
                         // SOCKET_SEQPACKET and therefore everything needs to be sent in a single packet.
-                        let data = &r.buf[..bytes_read];
+                        let data = r.buf.data();
                         for chunk in data.chunks(CONMON_CLIENT_BUFFER_SIZE) {
                             for &fd in console_fds {
                                 let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
@@ -732,14 +874,14 @@ impl Socket {
                     SocketType::Console => {
                         // Console socket: forward data to container's stdin.
                         if let Some(workerfd_stdin) = workerfd_stdin.as_ref() {
-                            let bytes_written = write(workerfd_stdin, &r.buf[..bytes_read])?;
+                            let bytes_written = write(workerfd_stdin, r.buf.data())?;
                             info!("bytes written: {}", bytes_written);
                         }
                         // Forward data to terminal.
                         for &fd in terminal_fds {
                             debug!("Forwarding to terminal {}", fd);
                             let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-                            write(borrowed, &r.buf[..bytes_read])?;
+                            write(borrowed, r.buf.data())?;
                         }
                         r.clear_buffer();
                     }
@@ -747,7 +889,7 @@ impl Socket {
                         // Relay whitelisted sd-notify lines from the container to the host.
                         // Some messages (e.g. BARRIER=1) are intentionally dropped; see conmon v2.
                         if let Some(notify_path) = &sdnotify_socket {
-                            let payload = filter_notify_payload(&r.buf[..bytes_read]);
+                            let payload = filter_notify_payload(r.buf.data());
                             if !payload.is_empty() {
                                 let (notify_fd, notify_addr) =
                                     make_notify_socket_and_addr(notify_path)?;
@@ -883,13 +1025,13 @@ mod next_line_tests {
         let (r, _w) = nix::unistd::pipe2(OFlag::O_CLOEXEC).expect("pipe");
         let mut socket = RemoteSocket::new(socket_type, r);
         assert!(
-            data.len() <= socket.buf.len(),
+            data.len() <= socket.buf.capacity(),
             "test data exceeds RemoteSocket buffer capacity"
         );
         let len = data.len();
-        socket.buf[..len].copy_from_slice(data);
-        socket.buf_start = 0;
-        socket.buf_end = len;
+        socket.buf.data[..len].copy_from_slice(data);
+        socket.buf.start = 0;
+        socket.buf.end = len;
         socket
     }
 
@@ -904,8 +1046,8 @@ mod next_line_tests {
         assert_eq!(second, "2 0 0\n");
 
         assert!(socket.next_line()?.is_none());
-        assert_eq!(socket.buf_start, 0);
-        assert_eq!(socket.buf_end, 0);
+        assert_eq!(socket.buf.start, 0);
+        assert_eq!(socket.buf.end, 0);
         Ok(())
     }
 
@@ -926,7 +1068,7 @@ mod next_line_tests {
         let mut socket = socket_with_buffered_data(b"a\nbc\n", SocketType::ConsoleFifo);
 
         assert_eq!(socket.next_line()?.as_deref(), Some("a\n"));
-        assert!(socket.buf_start > 0);
+        assert!(socket.buf.start > 0);
 
         assert_eq!(socket.next_line()?.as_deref(), Some("bc\n"));
         Ok(())
@@ -938,7 +1080,7 @@ mod next_line_tests {
 
         assert_eq!(socket.next_line()?.as_deref(), Some("first\n"));
         assert!(socket.next_line()?.is_none());
-        assert_eq!(&socket.buf[socket.buf_start..socket.buf_end], b"partial");
+        assert_eq!(socket.buf.data(), b"partial");
         Ok(())
     }
 
