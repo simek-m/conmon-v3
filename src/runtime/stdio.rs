@@ -268,29 +268,13 @@ fn poll_fd(fd: BorrowedFd<'_>, timeout: Duration) -> ConmonResult<bool> {
     }
 }
 
-/// Remove a console/terminal peer FD from forward lists before its `OwnedFd` is dropped.
-fn remove_forward_fd(console_fds: &mut Vec<RawFd>, terminal_fds: &mut Vec<RawFd>, socket: &Socket) {
-    let Socket::Remote(remote) = socket else {
-        return;
-    };
-
-    let fds = match remote.socket_type {
-        SocketType::Console => console_fds,
-        SocketType::Terminal => terminal_fds,
-        _ => return,
-    };
-
-    let fd = remote.fd.as_raw_fd();
-    fds.retain(|&candidate| candidate != fd);
-}
-
 /// Handle a peer that reached read-side EOF without dropping the socket.
 ///
 /// Attach clients often EOF the read side immediately (no stdin) while still
-/// expecting stdout/stderr writes, so Console FDs stay in `console_fds`.
-/// Terminal peers stop receiving forwarded stdin.
+/// expecting stdout/stderr writes, so Console peers stay alive for writing.
+/// Terminal peers that reach EOF are skipped by the `handle_data` with
+/// the `read_closed` flag.
 fn on_peer_read_eof(
-    terminal_fds: &mut Vec<RawFd>,
     socket: &Socket,
     stdin_attached: bool,
     leave_stdin_open: bool,
@@ -300,18 +284,12 @@ fn on_peer_read_eof(
         return;
     };
 
-    match remote.socket_type {
-        SocketType::Console if stdin_attached && !leave_stdin_open => {
-            workerfd_stdin.take();
-        }
-        SocketType::Terminal => {
-            terminal_fds.retain(|&candidate| candidate != remote.fd.as_raw_fd());
-        }
-        _ => {}
+    if remote.socket_type == SocketType::Console && stdin_attached && !leave_stdin_open {
+        workerfd_stdin.take();
     }
 }
 
-/// Handles incomming data on fds and forwards them to right destination.
+/// Handles incoming data on fds and forwards them to right destination.
 /// This function blocks until the container is running.
 /// # Arguments
 ///
@@ -349,31 +327,17 @@ where
     debug!("Starting event loop");
     let mut sockets: Vec<Socket> = Vec::new();
     let mut new_sockets: Vec<RemoteSocket> = Vec::new();
-    let mut fds: Vec<PollFd> = vec![];
-
-    // Helpers containing fds for console, terminal and stdout, so we can easily
-    // forward data to them.
-    let mut console_fds = Vec::new();
-    let mut terminal_fds = Vec::new();
-    let mut stdout_fd: i32 = -1;
 
     // Optional attach socket.
-    // WARN: The attach socket must be in `fds` before the stdout and stderr,
-    // otherwise the stdout/stderr read is handled before the attach accept
-    // callback and some data from stdout/stderr can be lost.
+    // WARN: The attach socket must come before stdout and stderr, otherwise the
+    // stdout/stderr read is handled before the attach accept callback and some
+    // data from stdout/stderr can be lost.
     if let Some(attach) = attach_socket {
-        if let Some(fd) = attach.fd() {
-            let borrowed = unsafe { BorrowedFd::borrow_raw(fd.as_raw_fd()) };
-            fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
-        }
         sockets.push(Socket::Unix(attach));
     }
 
     // Container's stdout.
     if let Some(stdout) = mainfd_stdout.take() {
-        stdout_fd = stdout.as_raw_fd();
-        let borrowed = unsafe { BorrowedFd::borrow_raw(stdout.as_raw_fd()) };
-        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
         sockets.push(Socket::Remote(RemoteSocket::new(
             SocketType::Stdout,
             stdout,
@@ -381,8 +345,6 @@ where
     }
 
     // Container's stderr.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(mainfd_stderr.as_raw_fd()) };
-    fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
     sockets.push(Socket::Remote(RemoteSocket::new(
         SocketType::Stderr,
         mainfd_stderr,
@@ -390,55 +352,72 @@ where
 
     // Optional terminal socket.
     if let Some(terminal) = terminal_socket {
-        stdout_fd = terminal.fd.as_raw_fd();
-        terminal_fds.push(terminal.fd.as_raw_fd());
-        let borrowed = unsafe { BorrowedFd::borrow_raw(terminal.fd.as_raw_fd()) };
-        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
         sockets.push(Socket::Remote(terminal));
     }
 
     // Optional ctl fifo.
     if let Some(ctl) = ctl_fifo {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(ctl.fd.as_raw_fd()) };
-        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
         sockets.push(Socket::Remote(ctl));
     }
 
     // Optional winsz fifo.
     if let Some(winsz) = winsz_fifo {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(winsz.fd.as_raw_fd()) };
-        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
         sockets.push(Socket::Remote(winsz));
     }
 
     // Optional OOM socket.
     if let Some(oom) = oom_socket {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(oom.fd.as_raw_fd()) };
-        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
         sockets.push(Socket::Remote(oom));
     }
 
     // Optional systemd notify socket.
     if let Some(notify) = notify_socket {
-        let borrowed = unsafe { BorrowedFd::borrow_raw(notify.fd.as_raw_fd()) };
-        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
         sockets.push(Socket::Remote(notify));
     }
 
-    // Signal fd to recieve UNIX signals.
+    // Signal FD to receive UNIX signals.
+    // It is owned by the RuntimeSession and borrowed raw
+    // here only for polling.
     if signal_fd > 0 {
         info!("SignalFD: {}", signal_fd);
-        let borrowed = unsafe { BorrowedFd::borrow_raw(signal_fd) };
-        fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
-        sockets.push(Socket::Invalid());
+        sockets.push(Socket::Signal(signal_fd));
     }
 
     // Main loop.
     // Iterates as long as we have some RemoteSocket to read from or
     // as long as `idle_callback` returns `true`.
     while sockets.iter().any(|s| matches!(s, Socket::Remote(_))) {
+        // Build the poll set each iteration by borrowing the fds owned by
+        // `sockets`.
+        let mut pollfds: Vec<PollFd> = sockets
+            .iter()
+            .map(|socket| match socket {
+                Socket::Unix(listener) => PollFd::new(
+                    listener
+                        .fd()
+                        .expect("listening socket must have an fd")
+                        .as_fd(),
+                    PollFlags::POLLIN,
+                ),
+                Socket::Remote(remote) => {
+                    // A socket whose read side reached EOF is no longer polled,
+                    // but stays alive for writing.
+                    let events = if remote.read_closed {
+                        PollFlags::empty()
+                    } else {
+                        PollFlags::POLLIN
+                    };
+                    PollFd::new(remote.fd.as_fd(), events)
+                }
+                // The signal fd is only borrowed by its raw value here.
+                Socket::Signal(fd) => {
+                    PollFd::new(unsafe { BorrowedFd::borrow_raw(*fd) }, PollFlags::POLLIN)
+                }
+            })
+            .collect();
+
         // Run poll to get informed about new fd events.
-        let n = poll(&mut fds, 10_u16).map_err(|e| {
+        let n = poll(&mut pollfds, 10_u16).map_err(|e| {
             ConmonError::new(
                 format!(
                     "handle_stdio poll() failed: {}",
@@ -447,6 +426,11 @@ where
                 1,
             )
         })?;
+
+        // Snapshot the results so the borrow of `sockets` is released before it
+        // is mutated below. `revents` stays index-aligned with `sockets`.
+        let mut revents: Vec<Option<PollFlags>> = pollfds.iter().map(|pfd| pfd.revents()).collect();
+        drop(pollfds);
 
         // We have no fd to read from, so execute the idle function.
         if n == 0 {
@@ -458,21 +442,19 @@ where
             continue;
         }
 
-        // We will mutate fds/remote_sockets, so iterate by index.
+        // We will mutate sockets/revents, so iterate by index.
         let mut i = 0;
-        while i < fds.len() {
-            // The poll fd.
-            let pfd = &fds[i];
+        while i < revents.len() {
             // If `false`, we close the socket completely.
             let mut keep_socket = true;
             // if `false`, we close the read side of the socket.
             let mut continue_reading = true;
 
-            if let Some(revents) = pfd.revents() {
-                if revents.contains(PollFlags::POLLIN) {
-                    // If the POLLIN comes from the signal fd, run the idle_callback to handle
-                    // the received signal.
-                    if pfd.as_fd().as_raw_fd() == signal_fd {
+            if let Some(events) = revents[i] {
+                if events.contains(PollFlags::POLLIN) {
+                    // If the POLLIN comes from the signal fd, run the idle_callback to
+                    // handle the received signal.
+                    if matches!(sockets[i], Socket::Signal(_)) {
                         if !idle_callback(true)? {
                             info!("idle_callback stopped the event loop after signal.");
                             return Ok(());
@@ -482,51 +464,40 @@ where
                     }
 
                     // Handle the received data.
-                    continue_reading = sockets[i].handle_data(
+                    continue_reading = Socket::handle_data(
+                        &mut sockets,
+                        i,
                         log_plugin,
                         &mut new_sockets,
                         workerfd_stdin.as_ref(),
-                        &console_fds,
-                        &terminal_fds,
-                        stdout_fd,
                         &notify_host_path,
                     )?;
 
-                    // Add new sockets to `sockets` and `fds`.
-                    // This happens when `attach` accepts new connection in the `handle_data`.
-                    if !new_sockets.is_empty() {
-                        while !new_sockets.is_empty() {
-                            let new_socket = new_sockets.pop();
-                            info!("Adding {:?} into poll fds", new_socket);
-                            if let Some(n_s) = new_socket {
-                                if n_s.socket_type == SocketType::Console {
-                                    console_fds.push(n_s.fd.as_raw_fd());
-                                }
-                                let borrowed =
-                                    unsafe { BorrowedFd::borrow_raw(n_s.fd.as_raw_fd()) };
-                                fds.push(PollFd::new(borrowed, PollFlags::POLLIN));
-                                sockets.push(Socket::Remote(n_s));
-                            }
-                        }
-                        new_sockets.clear();
+                    // Add connections accepted during this iteration and
+                    // keep it aligned with the `revents` vector.
+                    while let Some(n_s) = new_sockets.pop() {
+                        info!("Adding {:?} into poll fds", n_s);
+                        sockets.push(Socket::Remote(n_s));
+                        revents.push(None);
                     }
-                } else if revents.contains(PollFlags::POLLHUP) {
+                } else if events.contains(PollFlags::POLLHUP) {
                     // On HUP, close the socket.
-                    debug!("HUP on {:?}", pfd);
+                    debug!("HUP on {:?}", sockets[i]);
                     keep_socket = false;
                 }
             }
 
             if !continue_reading {
-                // Close the read part of the socket.
-                debug!("Shutdown {:?}", fds[i].as_fd().as_raw_fd());
-                unsafe { shutdown(fds[i].as_fd().as_raw_fd(), SHUT_RD) };
-
-                // Remove it from fds we call poll for.
-                fds[i].set_events(PollFlags::empty());
+                // Close the read part of the socket and stop polling it for
+                // input; it may still be a write target (e.g. attach client).
+                if let Socket::Remote(remote) = &mut sockets[i] {
+                    let raw = remote.fd.as_raw_fd();
+                    debug!("Shutdown {}", raw);
+                    unsafe { shutdown(raw, SHUT_RD) };
+                    remote.read_closed = true;
+                }
 
                 on_peer_read_eof(
-                    &mut terminal_fds,
                     &sockets[i],
                     stdin_attached,
                     leave_stdin_open,
@@ -538,13 +509,10 @@ where
                 // Go to next socket in case we want to keep this one.
                 i += 1;
             } else {
-                // Remove the fd completely. Dropping the socket closes the OwnedFd,
-                // so clear it from forward lists first to avoid later writev/write
-                // to a recycled FD number.
-                remove_forward_fd(&mut console_fds, &mut terminal_fds, &sockets[i]);
+                // Remove the fd completely.
                 let socket = sockets.swap_remove(i);
                 info!("Removing socket {:?}", socket);
-                fds.swap_remove(i);
+                revents.swap_remove(i);
 
                 // Do NOT increment the `i`, since it now points to swapped fd.
             }
@@ -725,93 +693,22 @@ mod tests {
     }
 
     #[test]
-    fn read_eof_keeps_attach_fd_in_console_fds() -> ConmonResult<()> {
+    fn read_eof_closes_container_stdin_when_attached() -> ConmonResult<()> {
         let (attach_r, _attach_w) = pipe2(OFlag::O_CLOEXEC)?;
-        let attach_fd = attach_r.as_raw_fd();
         let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC)?;
         drop(stdin_r);
         let sockets = [Socket::Remote(RemoteSocket::new(
             SocketType::Console,
             attach_r,
         ))];
-        let console_fds = [attach_fd];
-        let mut terminal_fds = Vec::new();
         let mut workerfd_stdin = Some(stdin_w);
 
-        on_peer_read_eof(
-            &mut terminal_fds,
-            &sockets[0],
-            true,
-            false,
-            &mut workerfd_stdin,
-        );
+        on_peer_read_eof(&sockets[0], true, false, &mut workerfd_stdin);
 
-        assert!(
-            console_fds.contains(&attach_fd),
-            "attach FD must remain in console_fds after read-side EOF"
-        );
         assert!(
             workerfd_stdin.is_none(),
             "container stdin is closed when the attach client EOFs"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn read_eof_stops_forwarding_to_terminal() -> ConmonResult<()> {
-        let (term_r, _term_w) = pipe2(OFlag::O_CLOEXEC)?;
-        let term_fd = term_r.as_raw_fd();
-        let sockets = [Socket::Remote(RemoteSocket::new(
-            SocketType::Terminal,
-            term_r,
-        ))];
-        let mut terminal_fds = vec![term_fd];
-        let mut workerfd_stdin = None;
-
-        on_peer_read_eof(
-            &mut terminal_fds,
-            &sockets[0],
-            false,
-            false,
-            &mut workerfd_stdin,
-        );
-
-        assert!(
-            !terminal_fds.contains(&term_fd),
-            "terminal FD must be removed from terminal_fds after read-side EOF"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn socket_removal_clears_forward_fd_before_owned_fd_drop() -> ConmonResult<()> {
-        // Mirrors the event-loop removal path: remove_forward_fd, then swap_remove/drop.
-        let (attach_r, _attach_w) = pipe2(OFlag::O_CLOEXEC)?;
-        let stale_fd = attach_r.as_raw_fd();
-        let mut sockets = vec![Socket::Remote(RemoteSocket::new(
-            SocketType::Console,
-            attach_r,
-        ))];
-        let mut console_fds = vec![stale_fd];
-        let mut terminal_fds = Vec::new();
-
-        remove_forward_fd(&mut console_fds, &mut terminal_fds, &sockets[0]);
-        let removed = sockets.swap_remove(0);
-        drop(removed);
-
-        assert!(
-            !console_fds.contains(&stale_fd),
-            "stale attach FD must be cleared before OwnedFd drop"
-        );
-
-        let (new_r, _new_w) = pipe2(OFlag::O_CLOEXEC)?;
-        let reused = new_r.as_raw_fd();
-        if reused == stale_fd {
-            assert!(
-                !console_fds.contains(&reused),
-                "recycled FD number must not remain in console_fds"
-            );
-        }
         Ok(())
     }
 }
