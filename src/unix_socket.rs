@@ -23,7 +23,7 @@ use crate::{
 use std::{
     ffi::OsStr,
     io,
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::{AsRawFd, FromRawFd, RawFd},
     os::unix::ffi::OsStrExt,
 };
 
@@ -272,6 +272,9 @@ pub struct RemoteSocket {
 
     /// Handler to call on new data.
     handler: Option<RemoteSocketHandler>,
+
+    /// Set when the read side reached EOF.
+    pub(crate) read_closed: bool,
 }
 
 impl fmt::Debug for RemoteSocket {
@@ -293,6 +296,7 @@ impl RemoteSocket {
             fd,
             buf: SocketBuffer::new(),
             handler: None,
+            read_closed: false,
         }
     }
 
@@ -414,6 +418,7 @@ impl From<UnixSocket> for RemoteSocket {
             fd: us.fd.take().unwrap(),
             buf: SocketBuffer::new(),
             handler: None,
+            read_closed: false,
         }
     }
 }
@@ -778,41 +783,38 @@ fn filter_notify_payload(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Enum representing UnixSocket, RemoteSocket or invalid socket.
+/// Enum representing a UnixSocket, RemoteSocket or the Signal FD.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Socket {
     Unix(UnixSocket),
     Remote(RemoteSocket),
-    Invalid(),
+    Signal(RawFd),
 }
 
 impl Socket {
-    /// Handles the POLLIN event for a Socket.
+    /// Handles the POLLIN event for the socket at `sockets[i]`.
     ///
     /// # Arguments
     ///
+    /// * `sockets` - The full poll set; `sockets[i]` is the source to read from.
     /// * `log_plugin` - The log plugin to forward container message to.
     /// * `new_sockets` - Vector into which newly created RemoteSocket can be added into.
     /// * `workerfd_stdin` - The container's stdin.
-    /// * `console_fds` - The list of podman's fds using which the podman receives
-    ///   stdout/stderr data from container.
-    /// * `terminal_fds` - Terminal fds into which we forward data for container's stdin.
-    /// * `stdout_fd` - The fd of container's stdout. We use it to change the terminal
-    ///   size.
     /// * `sdnotify_socket` - Path to systemd's "notify.sock".
-    #[allow(clippy::too_many_arguments)]
     pub fn handle_data(
-        &mut self,
+        sockets: &mut [Socket],
+        i: usize,
         log_plugin: &mut dyn LogPlugin,
         new_sockets: &mut Vec<RemoteSocket>,
         workerfd_stdin: Option<&OwnedFd>,
-        console_fds: &Vec<i32>,
-        terminal_fds: &Vec<i32>,
-        stdout_fd: i32,
         sdnotify_socket: &Option<PathBuf>,
     ) -> ConmonResult<bool> {
-        match self {
+        // The set is split into disjoint borrows so the source socket can be read
+        // while its peers are written to.
+        let (before, tail) = sockets.split_at_mut(i);
+        let (source, after) = tail.split_first_mut().expect("i within bounds");
+        match source {
             Socket::Unix(l) => {
                 // Unix socket. Just `accept` new client connection and return.
                 if let Some(remote) = l.accept()? {
@@ -860,13 +862,16 @@ impl Socket {
                         // SOCKET_SEQPACKET and therefore everything needs to be sent in a single packet.
                         let data = r.buf.data();
                         for chunk in data.chunks(CONMON_CLIENT_BUFFER_SIZE) {
-                            for &fd in console_fds {
-                                let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+                            for sock in before.iter().chain(after.iter()) {
+                                let Socket::Remote(peer) = sock else { continue };
+                                if peer.socket_type != SocketType::Console {
+                                    continue;
+                                }
                                 let iov = [
                                     std::io::IoSlice::new(prefix_buf),
                                     std::io::IoSlice::new(chunk),
                                 ];
-                                writev(borrowed, &iov)?;
+                                writev(peer.fd.as_fd(), &iov)?;
                             }
                         }
                         r.clear_buffer();
@@ -878,10 +883,13 @@ impl Socket {
                             info!("bytes written: {}", bytes_written);
                         }
                         // Forward data to terminal.
-                        for &fd in terminal_fds {
-                            debug!("Forwarding to terminal {}", fd);
-                            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-                            write(borrowed, r.buf.data())?;
+                        for sock in before.iter().chain(after.iter()) {
+                            let Socket::Remote(peer) = sock else { continue };
+                            if peer.socket_type != SocketType::Terminal || peer.read_closed {
+                                continue;
+                            }
+                            debug!("Forwarding to terminal {}", peer.fd.as_raw_fd());
+                            write(peer.fd.as_fd(), r.buf.data())?;
                         }
                         r.clear_buffer();
                     }
@@ -909,6 +917,15 @@ impl Socket {
                     }
                     SocketType::TerminalFifo | SocketType::ConsoleFifo => {
                         // We received control message for "ctlr" or "winsz".
+                        // Resize target: terminal pty if present, else container stdout.
+                        let resize_target = |ty| {
+                            before.iter().chain(after.iter()).find_map(|s| match s {
+                                Socket::Remote(p) if p.socket_type == ty => Some(p.fd.as_raw_fd()),
+                                _ => None,
+                            })
+                        };
+                        let stdout_fd = resize_target(SocketType::Terminal)
+                            .or_else(|| resize_target(SocketType::Stdout));
                         // Handle all complete lines. Invalid UTF-8 is logged and
                         // skipped like other malformed control lines, so one bad
                         // line cannot abort the stdio event loop.
@@ -922,6 +939,7 @@ impl Socket {
                                 }
                             };
 
+                            let Some(stdout_fd) = stdout_fd else { continue };
                             if r.socket_type == SocketType::TerminalFifo {
                                 if let Err(err) =
                                     process_terminal_ctrl_line(log_plugin, stdout_fd, &line)
@@ -936,7 +954,7 @@ impl Socket {
                     SocketType::Inotify | SocketType::SignalFd | SocketType::Attach => {}
                 }
             }
-            Socket::Invalid() => {
+            Socket::Signal(_) => {
                 return Ok(true);
             }
         }

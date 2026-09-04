@@ -118,7 +118,7 @@ pub struct RuntimeSession {
     /// Host counter-part of `notify_socket`.
     sdnotify_socket_path: Option<PathBuf>,
 
-    /// The signal-fd to handle incomming UNIX signals.
+    /// The signal-fd to handle incoming UNIX signals.
     signals: Option<SignalFd>,
 
     // Open file descriptor snapshot.
